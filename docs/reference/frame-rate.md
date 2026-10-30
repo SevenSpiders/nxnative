@@ -226,6 +226,13 @@ Frame pacing: the host's frame step, engine frame limiters, present intervals an
 - **Found on:** [PR #665](https://github.com/seedds/nxnative/pull/665), the NX2Apple launcher's console mode (LNPANDY/NX2Apple), tested by its reporter with [Hades II](../../dm/games/0100A00019DE0000/README.md).
 - **Check:** the reporter confirmed that the deferred request entered fullscreen on its first attempt and stayed there, without a refusal. A harness of the startup callbacks checks both readiness orders, bounded refusal recovery, and cancellation before startup or a queued retry, plus later manual failures after successful startup.
 - **Not checked:** the revised lifecycle handling in a real game through the launcher's console mode; native refusal recovery (the reporter's deferred request succeeded without it).
+### The pointer stays on a Mac game
+
+- **Symptom:** the mouse pointer stayed on the picture of a Mac game, in a window and in fullscreen, until it was moved to a screen corner.
+- **Cause:** `front_run` never hid it. macOS hides the pointer only for an app that asks, and a game window is not one.
+- **Fix:** `front_mac.m` `front_run` hides it after `DM_CURSOR_HIDE` seconds (3 by default, `0` keeps it) without movement over the game view, and shows it on the next movement, click or scroll (a local event monitor and a 0.25 s timer). It is shown whenever the window is not key or the pointer is outside the game view, so the title bar and other windows keep theirs.
+- **Found on:** a game played with a controller (Console Mode), no game in particular.
+- **Not checked:** not yet run on a game here.
 
 ### Frame latency 2 for the display link in fullscreen
 
