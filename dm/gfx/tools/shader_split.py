@@ -944,6 +944,84 @@ def nlg_dict(d, label):
     names = d[co + 0x10 * nchunk:].split(b'\0')[:nname]
     return comp, recs, chunks, [n.decode('latin-1') for n in names]
 
+def nlg_rev2(d):
+    """Next Level Games' second archive revision (Mario Strikers: Battle League): the same magic, a 0x40-byte
+    header (Luigi's Mansion 3's first revision has 0x10) and a zstd stream at +0x40 where the first revision keeps
+    its plain index. The index maps names to offsets and is not needed to read shaders: the game reads its own
+    archives at run time and the split only harvests the shaders, which sit in the .data/.patch zstd frames."""
+    return len(d) > 0x44 and d[:4] == NLG_DICT and d[0x40:0x44] == ZSTD_MAGIC
+
+
+def nlg2_frames(d):
+    """Every zstd frame of a revision-2 archive file, decompressed, in order: the frames are not all back to back
+    (init.data has regions between them), so each magic is tried and its own frame size advances the walk."""
+    zstd = zstd_mod(); pos = 0
+    while True:
+        i = d.find(ZSTD_MAGIC, pos)
+        if i < 0: return
+        try: n = zstd.get_frame_size(d[i:])
+        except Exception: n = 0
+        if 0 < n <= len(d) - i:
+            try:
+                yield zstd.decompress(d[i:i + n]); pos = i + n; continue
+            except Exception: pass
+        pos = i + 4
+
+
+def nlg2_shaders(path, label, out):
+    """Shaders of a revision-2 archive ('<name>.dict' beside '<name>.data' and '<name>.patch', Mario Strikers:
+    Battle League). Each zstd frame is a section: some hold control sections back to back (0x880 bytes from a CTL
+    magic), others the code areas of one variant (GFX/CS magic). Controls pair with the code areas in order,
+    skipping gaps by stepping to the next code-area header; every pair is checked by stage and lengths, and a
+    slice that contains a control section is rejected. Frames that mix controls and code in one block (global.data
+    frame 68) keep their table order, which the index would have to give — the host's shader capture covers those
+    (captured_shaders). The index itself is not read: the game reads its archives at run time."""
+    stem = path[:-len('.dict')]
+    for suffix in ('.data', '.patch'):
+        p = stem + suffix
+        if not os.path.exists(p): continue
+        with open(p, 'rb') as f: d = f.read()
+        ctls, parts = [], []
+        for blob in nlg2_frames(d):
+            if blob[:4] == CTL_MAGIC:
+                for j in range(0, len(blob) - 0x883, 0x880):
+                    if blob[j:j + 4] != CTL_MAGIC: break
+                    ctls.append(blob[j:j + 0x880])
+            elif blob[:4] in (GFX_MAGIC, CS_MAGIC):
+                parts.append(blob)
+        if ctls and parts:
+            left = nlg2_place(ctls, b''.join(parts), label + suffix, out)
+            if left: print(f'[RED] {label}{suffix}: {len(left)} control section(s) without a code area', flush=True)
+
+
+def nlg2_place(ctls, code, label, out, start=0, end=None):
+    """Pairs each control with the next code area in code (a GFX/CS magic in [start, end) whose stage and lengths
+    validate) → the controls that found none. A run's code areas never reach into the next control run, which the
+    bound keeps honest. The headers are collected once, so the walk stays linear."""
+    end = len(code) if end is None else min(end, len(code))
+    magics = [m.start() for m in re.finditer(re.escape(GFX_MAGIC) + b'|' + re.escape(CS_MAGIC), code)]
+    mi = 0
+    while mi < len(magics) and magics[mi] < start: mi += 1
+    q = magics[mi] if mi < len(magics) and magics[mi] < end else -1
+    if q < 0: return list(ctls)
+    left = []
+    for ctl in ctls:
+        n = struct.unpack_from('<I', ctl, 0x704)[0]
+        found = None
+        for _ in range(64):
+            cd = code[q:q + n]
+            st = glslc_stage(ctl, cd) if q + n <= end else None
+            # a real code area never contains a control section: that slice ran into the next control
+            if st and CTL_MAGIC not in cd and not check(label, st, ctl, cd): found = st; break
+            while mi < len(magics) and magics[mi] <= q: mi += 1
+            if mi >= len(magics) or magics[mi] >= end: break
+            q = magics[mi]; mi += 1
+        if not found:
+            left.append(ctl); continue
+        out.append((f'{label}#NLG2@{q:#x}', found, ctl, cd)); q += n
+    return left
+
+
 def nlg_walk(tab, start, count, out):
     """The plain entries of a variant's table in the game's order (lists inline, depth first; main+0x1cbd0)"""
     for i in range(start, start + count):
@@ -977,6 +1055,7 @@ def nlg_shaders(path, label, out):
     Every variant whose files are in RomFS is read (the 13 even records; the odd ones point into '.nxpc', which is not shipped), and the shaders found pair by order (checked one by one)"""
     import zlib
     d = open(path, 'rb').read(); stem = path[:-len('.dict')]
+    if nlg_rev2(d): return nlg2_shaders(path, label, out)
     comp, recs, chunks, names = nlg_dict(d, label)
     files = {i: open(stem + nm, 'rb').read() for i, nm in enumerate(names) if os.path.exists(stem + nm)}
     patch = open(stem + '.patch', 'rb').read() if os.path.exists(stem + '.patch') else None
@@ -1533,6 +1612,31 @@ def phyre_shaders(d, label):
         ctl, code = d[c:c + cn], d[k:c]
         st = sph_stage(code)
         if st and not check(label, st, ctl, code): out.append((f'{label}#PHYRE@{k:#x}', st, ctl, code))
+    return out
+
+
+def captured_shaders(directory):
+    """Shaders the host saved because no reader could reach them (DM_NVN_SHDUMP=<dir> writes '<key>.ctl' and
+    '<key>.code' for every program the game asked for and the shader map did not have). The pair is the same
+    control section + code area the game submits, so it goes into the package like any other shader. This is the
+    fallback for archives whose entry order is not readable offline (Mario Strikers: Battle League's revision 2,
+    where the controls and their code areas sit in one frame in table order, not file order)."""
+    out = []
+    if not os.path.isdir(directory): return out
+    for name in sorted(os.listdir(directory)):
+        if not name.endswith('.ctl'): continue
+        ctl_p = os.path.join(directory, name)
+        code_p = ctl_p[:-4] + '.code'
+        if not os.path.exists(code_p): continue
+        try:
+            ctl = open(ctl_p, 'rb').read(); code = open(code_p, 'rb').read()
+        except OSError:
+            continue
+        if ctl[:4] != CTL_MAGIC:
+            print(f'[RED] {ctl_p}: not a control section', flush=True); continue
+        st = glslc_stage(ctl, code)
+        if not st or check('/shader_capture/' + name[:-4], st, ctl, code): continue
+        out.append((f'/shader_capture/{name[:-4]}', st, ctl, code))
     return out
 
 
@@ -2558,6 +2662,9 @@ def main():
         found += tfxo_streams(img, 'main' + ('@' + tag if tag else ''))   # YEBIS's effect file, a zlib stream in main (Pokémon Sword)
         found += retro_main_forms(img, 'main' + ('@' + tag if tag else ''))   # Retro's startup material archive, LZSS in main (Donkey Kong Country: Tropical Freeze)
         found += raw_shaders(img, 'main' + ('@' + tag if tag else ''), {c for _, _, c, _ in found})
+        # shaders the host saved because no reader could reach them: <version dir>/shader_capture, or DM_NVN_SHADER_CAPTURE
+        capdir = os.environ.get('DM_NVN_SHADER_CAPTURE') or os.path.join(os.path.dirname(os.path.abspath(romfs)), 'shader_capture')
+        found += captured_shaders(capdir)
         # GLSLC outputs the game compiles at run time, captured on the Mac (hle_glslc.c): <version dir>/glslc_capture, or DM_GLSLC_CAPTURE. A game needs them when main holds GLSL sources and
         # calls glslcCompile in a module it loads (Fire Emblem: Three Houses; profile_guess.py shader_sources). Captain Toad: Treasure Tracker imports it with agl's GLSL sources, but no module defines it
         cap = os.environ.get('DM_GLSLC_CAPTURE') or os.path.join(os.path.dirname(os.path.abspath(romfs)), 'glslc_capture')
