@@ -1656,6 +1656,8 @@ def split_shaders(py, repo, roms, mains, pkg, env, logs, g, provisional=False, o
     inputs = [('files', tool_files(repo)), bool(provisional)] + [x for r, m in zip(roms, mains) for x in
         (('files', [m]), ('stat' if provisional else 'tree', r),
          ('stat', r.parent / 'glslc_capture') if provisional else ('files', sorted((r.parent / 'glslc_capture').glob('*.glslc'))),
+         # shaders the host saved because no reader could reach them (DM_NVN_SHDUMP): a new capture must resplit
+         ('stat', r.parent / 'shader_capture'),
          ('stat', r.parent / 'ue_shaders') if provisional else ('files', sorted((r.parent / 'ue_shaders').glob('*.ushaderbytecode'))))]
     inputs += [item for r in dlc_roms for item in (('dlc', Path(r).name), ('stat', r))]   # DLC has no registered module build to pin its contents: include its index and re-extraction times, even when file sizes stay the same
     if oodle:   # a host or rewriter fix can change what the game's decoder produces

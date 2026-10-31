@@ -1521,6 +1521,31 @@ def phyre_shaders(d, label):
     return out
 
 
+def captured_shaders(directory):
+    """Shaders the host saved because no reader could reach them (DM_NVN_SHDUMP=<dir> writes '<key>.ctl' and
+    '<key>.code' for every program the game asked for and the shader map did not have). The pair is the same
+    control section + code area the game submits, so it goes into the package like any other shader. This is the
+    fallback for archives whose entry order is not readable offline (Mario Strikers: Battle League's revision 2,
+    where the controls and their code areas sit in one frame in table order, not file order)."""
+    out = []
+    if not os.path.isdir(directory): return out
+    for name in sorted(os.listdir(directory)):
+        if not name.endswith('.ctl'): continue
+        ctl_p = os.path.join(directory, name)
+        code_p = ctl_p[:-4] + '.code'
+        if not os.path.exists(code_p): continue
+        try:
+            ctl = open(ctl_p, 'rb').read(); code = open(code_p, 'rb').read()
+        except OSError:
+            continue
+        if ctl[:4] != CTL_MAGIC:
+            print(f'[RED] {ctl_p}: not a control section', flush=True); continue
+        st = glslc_stage(ctl, code)
+        if not st or check('/shader_capture/' + name[:-4], st, ctl, code): continue
+        out.append((f'/shader_capture/{name[:-4]}', st, ctl, code))
+    return out
+
+
 def raw_shaders(d, label, known=()):
     """Control sections in main that are in no GLSLC output and no BNSH file: a shader compiled offline whose control section and code area the code hands to nvnShaderData itself (Advance Wars 1+2:
     Re-Boot Camp, Unity 2020.2 with Bink 2: the movie player's 32: 2 vertex, 22 pixel and 8 compute shaders; without them its movies drew white). Most are 0x20-byte records in data {code area
@@ -2543,6 +2568,9 @@ def main():
         found += tfxo_streams(img, 'main' + ('@' + tag if tag else ''))   # YEBIS's effect file, a zlib stream in main (Pokémon Sword)
         found += retro_main_forms(img, 'main' + ('@' + tag if tag else ''))   # Retro's startup material archive, LZSS in main (Donkey Kong Country: Tropical Freeze)
         found += raw_shaders(img, 'main' + ('@' + tag if tag else ''), {c for _, _, c, _ in found})
+        # shaders the host saved because no reader could reach them: <version dir>/shader_capture, or DM_NVN_SHADER_CAPTURE
+        capdir = os.environ.get('DM_NVN_SHADER_CAPTURE') or os.path.join(os.path.dirname(os.path.abspath(romfs)), 'shader_capture')
+        found += captured_shaders(capdir)
         # GLSLC outputs the game compiles at run time, captured on the Mac (hle_glslc.c): <version dir>/glslc_capture, or DM_GLSLC_CAPTURE. A game needs them when main holds GLSL sources and
         # calls glslcCompile in a module it loads (Fire Emblem: Three Houses; profile_guess.py shader_sources). Captain Toad: Treasure Tracker imports it with agl's GLSL sources, but no module defines it
         cap = os.environ.get('DM_GLSLC_CAPTURE') or os.path.join(os.path.dirname(os.path.abspath(romfs)), 'glslc_capture')
