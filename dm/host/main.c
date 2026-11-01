@@ -13,7 +13,9 @@ typedef void (*fn0)(void); typedef void (*fn2)(uint64_t, uint64_t); typedef void
 static void *req(const char *n){ void *p=guest_sym(n); if(!p) die("missing symbol %s", n); return p; }
 
 // Game arguments: argv[0] is fixed to "game", and whatever follows "--" is appended as is (on a real device nn::init takes them from the process argument area and hands them to the SDK through SetHostArgc/Argv)
-static char *g_argv[64] = {"game"}; static int g_argc = 1;
+// The array AND the strings are writable: a game may edit its own arguments in place (Star Wars: The Force Unleashed writes
+// a 0 into the token it is parsing), and a string literal lives in read-only __TEXT, where that store faults
+static char g_argv0[] = "game"; static char *g_argv[64] = {g_argv0}; static int g_argc = 1;
 
 static void guest_main(void) {
     guest_thread_init();
@@ -94,7 +96,7 @@ static void host_preload(int argc, char **argv) {
     const char *names[argc + DM_GAME_NMOD]; int n = 0;
     int i = 2;
     for (; i < argc && strcmp(argv[i], "--"); i++) names[n++] = argv[i];
-    if (i < argc && !strcmp(argv[i], "--")) for (i++; i < argc && g_argc < 63; i++) g_argv[g_argc++] = argv[i];
+    if (i < argc && !strcmp(argv[i], "--")) for (i++; i < argc && g_argc < 63; i++) g_argv[g_argc++] = strdup(argv[i]);   // writable copies, as above
     else if (*DM_GAME_ARGS) {   // no "--" on the command line (the iOS app, the NSP script's Mac runs): the game profile's game_args, split at spaces
         char *s = strdup(DM_GAME_ARGS);
         for (char *t = strtok(s, " "); t && g_argc < 63; t = strtok(NULL, " ")) g_argv[g_argc++] = t;
