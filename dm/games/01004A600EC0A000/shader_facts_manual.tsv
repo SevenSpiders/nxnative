@@ -1,0 +1,4 @@
+# Hand-written translation facts, merged over the generated rows of shader_facts.tsv by dm/gfx/tools/shader_split.py: key <TAB> facts JSON (same format)
+# Anvil copies a sampled texel into an integer render target (ID / picking / uint G-buffer). With no PC pairing the translator types every fragment output float, and Metal refuses those pipelines.
+6f07235e8369732b	{"fout":{"0":"uint"}}
+63bcc931e18b3515	{"fout":{"0":"uint"}}

@@ -1,0 +1,5 @@
+# Pixel shaders a pipeline blends with their output 1 as the second source (dual-source blending): dmsh_build.py gives each a dual-source entry point (fs_dual). Rows: shader key, noted by the host with DM_NVN_DUAL_WANT
+# 03cbd63fe553b97c: Image Calibration / menu overlay (without main0_d the second source is zero and the cursor / highlight does not draw)
+# 4a537d5bc1cf50e8: title-screen "PRESS … TO START" prompt (the button glyph is the second source)
+03cbd63fe553b97c
+4a537d5bc1cf50e8
