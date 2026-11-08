@@ -39,6 +39,7 @@
 #   · SNVN (Retro Studios, Donkey Kong Country: Tropical Freeze, Metroid Prime Remastered): zlib program records in the SNVN chunks of MaterialArchive.arc, of the MTRL resources in its
 #       .pak archives and of the startup material archive LZSS-compressed in main, see rfrm_shaders and retro_main_forms
 #   · BERG (Snowdrop, Mario + Rabbids Sparks of Hope): shader objects in the individually zstd-compressed records of its SDF data slices, see snowdrop_shaders
+#   · Scimitar .forge (Ubisoft Anvil, Immortals Fenyx Rising): GPUCODEONLY records in the *_nvn.forge packages (Oodle Mermaid, decoded by the game's own decoder in the Mac host), see forge_jobs and forge_shaders
 #   · bnd2 (Criterion's Bundle 2, Need for Speed: Hot Pursuit Remastered): whole GLSLC outputs in the zlib resources of SHADERS.BNDL, see bnd2_resources and bnd2_shaders
 #   · Heaps (Dead Cells): whole GLSLC outputs in base64 after the GLSL of the engine's shader cache (shaders.cache.nx), inside its PAK archive, see heaps_pak_files and heaps_shaders
 #   · Frostbite (EA SPORTS FC 27): the CompiledBytecode resources of the bundles its superbundle tables (.toc) list, in its cas files (Oodle Leviathan, decoded by the game's own decoder in the
@@ -460,6 +461,90 @@ def snowdrop_shaders(d, label, wrapped=True):
     for h, _, raw in chunks:
         out += snowdrop_shaders(raw, f'{label}#SDFZSTD@{h:#x}', wrapped=False)
     return out
+
+SCIMITAR, FORGE_NVN, FORGE_BLOCK = b'scimitar\0', b'FORG', 0x1004FA9957FBAA33
+def forge_entries(d):
+    """Scimitar v27/v28 TOC: DataHeader1 at the u64 at +13, DataHeader2, then 20-byte index records {off i64, id i64, size i32}. Fenyx 1.3.4 is version 28 with the v27 44-byte header."""
+    if d[:9] != SCIMITAR: return None
+    hdr = struct.unpack_from('<Q', d, 13)[0]
+    num, *_, off2 = struct.unpack_from('<i4iqiiq', d, hdr)
+    idx_count, _, off_index, *_ = struct.unpack_from('<iiqqiiqq', d, off2)
+    return [(struct.unpack_from('<qqi', d, off_index + 20 * i)) for i in range(idx_count)]
+
+def forge_block(d, o):
+    """One Anvil data-file block (magic 0x1004FA9957FBAA33): u16 version, u8 algo (10 = Oodle Mermaid), two u16 flags, u32 chunk count, then per chunk {decoded u32, stored u32} and Adler + data."""
+    if o + 19 > len(d) or struct.unpack_from('<Q', d, o)[0] != FORGE_BLOCK: return None
+    ver, algo = struct.unpack_from('<H', d, o + 8)[0], d[o + 10]
+    nchunk = struct.unpack_from('<I', d, o + 15)[0]
+    p = o + 19
+    sizes = [struct.unpack_from('<II', d, p + 8 * i) for i in range(nchunk)]
+    p += 8 * nchunk
+    chunks = []
+    for raw, stored in sizes:
+        if p + 4 + stored > len(d): red(f'forge block @{o:#x}: chunk stored {stored} at {p:#x} overruns the {len(d):#x} bytes')
+        p += 4; chunks.append((raw, stored, d[p:p + stored])); p += stored
+    return {'end': p, 'ver': ver, 'algo': algo, 'chunks': chunks}
+
+def forge_nvn_shaders(raw, label):
+    """NVN stages inside one inflated Anvil GPU payload. Each GPUCODEONLY record stores the Maxwell code area first (GFX_MAGIC / CS_MAGIC), 4 pad bytes, then the 0x880-byte control section;
+    control +0x704 is the code length. Programs are one stage; vertex/pixel pairs exist only at draw time."""
+    out = []; j = 0
+    while True:
+        c = raw.find(CTL_MAGIC, j)
+        if c < 0: break
+        if c + 0x708 > len(raw):
+            j = c + 1; continue
+        nctl = struct.unpack_from('<I', raw, c + 0x20)[0]
+        ncode = struct.unpack_from('<I', raw, c + 0x704)[0]
+        if not (0x760 <= nctl <= 0x1000 and 0x20 <= ncode <= 0x200000):
+            j = c + 1; continue
+        k = None
+        for pad in range(0, 17):
+            at = c - pad - ncode
+            if at >= 0 and raw[at:at + 4] in (GFX_MAGIC, CS_MAGIC):
+                k = at; break
+        if k is None:
+            j = c + 1; continue
+        ctl, code = raw[c:c + nctl], raw[k:k + ncode]
+        st = glslc_stage(ctl, code)
+        if st and not check(label, st, ctl, code): out.append((f'{label}#FORGE@{c:#x}', st, ctl, code))
+        j = c + nctl
+    return out
+
+def forge_jobs(files):
+    """Each *_nvn.forge Scimitar package is one job. Other .forge files (world data) are taken so the loose scan does not read them. → (jobs, every Scimitar path)"""
+    jobs, taken = [], set()
+    for p, r in files:
+        if not p.lower().endswith('.forge'): continue
+        with open(p, 'rb') as f: h = f.read(9)
+        if h != SCIMITAR: continue
+        taken.add(p)
+        if '_nvn' in os.path.basename(p).lower(): jobs.append((p, r, (FORGE_NVN,)))
+    return jobs, taken
+
+def forge_shaders(path, rel, out):
+    """A Scimitar *_nvn.forge (forge_jobs): each GPU entry is a 16-byte raw metadata block plus an Oodle Mermaid body; GPUCODEONLY records inside yield NVN control/code pairs."""
+    with open(path, 'rb') as f: d = f.read()
+    ents = forge_entries(d)
+    if ents is None: red(f'/{rel}: not a Scimitar forge')
+    for i, (off, fid, size) in enumerate(ents):
+        if off < 0 or size <= 0 or off + size > len(d): continue
+        o, end, payload = off, off + size, b''
+        while o + 8 <= end and struct.unpack_from('<Q', d, o)[0] == FORGE_BLOCK:
+            b = forge_block(d, o)
+            if not b: break
+            o = b['end']
+            if b['algo'] not in (0, 10): red(f'/{rel}#{i}: Anvil block algo {b["algo"]}, only 0 (stored) and 10 (Oodle Mermaid) are known')
+            if len(b['chunks']) == 1 and b['chunks'][0][0] <= 16 and b['chunks'][0][0] == b['chunks'][0][1]:
+                continue   # 16-byte Anvil metadata in front of the compressed body
+            parts = []
+            for raw, stored, data in b['chunks']:
+                if stored == raw or b['algo'] == 0: got = data
+                else: got = oodle(data, raw)
+                if len(got) != raw: red(f'/{rel}#{i}: Oodle {stored} → {raw} gave {len(got)}')
+                parts.append(got)
+            payload += b''.join(parts)
+        if payload: out += forge_nvn_shaders(payload, f'/{rel}#{i}')
 
 NEEDLE = b'HNSHV002'
 def needle_shaders(d, label):
@@ -2068,7 +2153,7 @@ _OODLE = None
 def oodle_ask(comp, n):
     """The game's own decoder: OodleLZ_Decompress (Trinity's packs are Oodle Mermaid, Pokémon Legends: Arceus's GFPAK entries Oodle Kraken, and Oodle is linked into main), or LZ5_decompress_safe (DRAGON QUEST XI S's legacy Unreal paks):
     one Mac host per worker process in its tool mode (dm/host/hle_oodle.c, DM_OODLE_SERVE), fed over a pipe. DM_OODLE_HOST = the host, DM_OODLE_MODULES = the rewritten modules it loads
-    (the NSP script sets both for a game with Trinity packs, Oodle PKZ or GFPAK entries, or legacy Unreal paks, profile_guess.py shader_sources). → (the decoded bytes or None, the host is gone)"""
+    (the NSP script sets both for a game with Trinity packs, Oodle PKZ or GFPAK entries, Scimitar nvn forges, or legacy Unreal paks, profile_guess.py shader_sources). → (the decoded bytes or None, the host is gone)"""
     global _OODLE
     if _OODLE is None:
         import tempfile
@@ -2985,6 +3070,11 @@ def scan_file_in(args):
     if len(args) > 2 and head[:4] == b'BDF3':   # entries of a FromSoftware dvdbnd archive (bdt_jobs)
         bdt_shaders(path, rel, args[2], found)
         return rel, uniq_keys(found), var_pairs(found), trees
+    if head[:9] == SCIMITAR:   # Scimitar .forge: only *_nvn packages hold NVN shaders; world forges are skipped without reading the rest
+        if len(args) > 2 and args[2][0] == FORGE_NVN:
+            forge_shaders(path, rel, found)
+            return rel, uniq_keys(found), var_pairs(found), trees
+        return rel, {}, set(), {}
     if len(args) > 2:   # a range of LINKDATA entries (linkdata_jobs)
         linkdata_shaders(path, rel, args[2], found)
         return rel, uniq_keys(found), var_pairs(found), trees
@@ -3156,8 +3246,9 @@ def main():
     ah_jobs, arhs = arh_jobs(files)   # Monolith's ARH1/ARD archives and embedded XBC1/HCPS programs
     fb_jobs, fbs = frostbite_jobs(files)   # EA SPORTS FC 27's Frostbite bundles, Oodle Leviathan decoded by the game's own decoder in the Mac host
     pd_jobs, pdats = pdat_jobs(files)   # Kirby Air Riders' PDAT archives: the PMAP records in byte ranges
-    big += pak_jobs + tr_jobs + ue_jobs + bd_jobs + arc_jobs + pz_jobs + ck_jobs + cr_jobs + zp_jobs + ah_jobs + fb_jobs + pd_jobs
-    files = [(p, r) for p, r in files if not linkdata_jobs(p, r) and p not in paks and p not in trp and p not in uep and p not in bdts and p not in arcs and p not in pkzs and p not in cpks and p not in cras and p not in zips and p not in arhs and p not in fbs and p not in pdats]
+    fg_jobs, forges = forge_jobs(files)   # Immortals Fenyx Rising's Scimitar *_nvn.forge packages, Oodle Mermaid decoded by the game's own decoder in the Mac host
+    big += pak_jobs + tr_jobs + ue_jobs + bd_jobs + arc_jobs + pz_jobs + ck_jobs + cr_jobs + zp_jobs + ah_jobs + fb_jobs + pd_jobs + fg_jobs
+    files = [(p, r) for p, r in files if not linkdata_jobs(p, r) and p not in paks and p not in trp and p not in uep and p not in bdts and p not in arcs and p not in pkzs and p not in cpks and p not in cras and p not in zips and p not in arhs and p not in fbs and p not in pdats and p not in forges]
     with cf.ProcessPoolExecutor(J, initializer=_pool_init, initargs=(common, {}, zdicts)) as ex:
         n = len(big) + len(files)
         results += pooled(ex, big, n) + pooled(ex, files, n, len(big), chunk=16)
@@ -3213,6 +3304,7 @@ def main():
                                             ('MT Framework SPK', any('#MTSPK@' in r[4] for r in rows)), ('MonoGame MGFX', any('#MGFX@' in r[4] for r in rows)),
                                             ('PlatinumGames shader objects', any('#PGSO' in r[4] for r in rows)),
                                             ('Snowdrop shader objects', any('#SNOWDROP@' in r[4] for r in rows)),
+                                            ('Scimitar forge GPUCODEONLY', any('#FORGE@' in r[4] for r in rows)),
                                             ('Unreal Engine shader code archives', any('#UE' in r[4] for r in rows))) if hit)
         f.write(f'# kind: evidence  {NOTE} ({kinds} in RomFS + main) → control section + code area keys (dm/gfx/tools/shader_split.py)\n')
         f.write('# column 5 records where each key first appears; no PC shader pairing supplied\n')

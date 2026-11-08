@@ -250,6 +250,13 @@ Finding, keying and translating shaders (`dm/gfx/tools/shader_split.py`, `dmsh_b
 - **Reader:** `kpka_jobs` maps the PAKs, takes the newest copy of each path, peeks at 4 decompressed bytes and inflates only SDF entries (`sdf_shaders`).
 - **Found on:** [Monster Hunter Rise](../../dm/games/0100B04011742000/README.md): 63,111 shaders (30,233 vertex, 21,475 pixel, 11,271 compute, 53 geometry, 33 hull, 46 domain) and 102,345 pairs, in 5 s with 12 jobs.
 
+### GPUCODEONLY records in Scimitar nvn forges
+
+- **Symptom:** the split finds no shaders in a RomFS of `.forge` files (`scimitar` magic), while reporting no BNSH, BAHS or GLSLC outputs.
+- **Cause:** Ubisoft Anvil (Scimitar) keeps world data and GPU programs in the same archive format. Only `*_nvn.forge` packages hold shaders. Each GPU entry is a 16-byte Anvil metadata block plus an Oodle Mermaid body (`8c 0a`). Inside, a GPUCODEONLY record stores the Maxwell code area first (`GFX_MAGIC` / `CS_MAGIC`), 0–16 pad bytes, then a 0x880-byte control section; control +0x704 is the code length. These are neither BNSH nor whole GLSLC outputs. The other `.forge` files are world data and must not be read as loose files (they add up to many GB).
+- **Fix:** `shader_split.py` recognizes `scimitar\0` by magic (`forge_jobs`, `forge_shaders`). Each `*_nvn.forge` is one job; every other Scimitar file is taken so the loose scan skips it. Anvil blocks of algo 10 are decoded with the game's own Oodle in the Mac host (`oodle`, `DM_OODLE_HOST` / `DM_OODLE_MODULES`), as for Trinity packs. Pairing is code-before-control, checked through the existing control / code / stage validation. Programs hold one stage, and the vertex shaders take the [single-stage cover](#single-stage-programs-paired-with-a-cover). `profile_guess.py` turns the Oodle decoder on for a RomFS with Scimitar magics (`oodle_packs`) and groups the nvn packages (`shader_groups _nvn.forge=nvn`).
+- **Found on:** [Immortals Fenyx Rising](../../dm/games/01004A600EC0A000/README.md) 1.3.4: nine `*_nvn.forge` packages (of 372 `.forge` files) yield 19,603 unique shaders (12,377 vertex, 7,210 pixel, 8 hull, 8 domain). All translate and compile for the Mac.
+
 ### Shader records in Snowdrop SDF data slices
 
 - **Symptom:** the split finds no shaders in a RomFS made of `.sdfdata`, `.sdftoc` and `.sdfver` files.
